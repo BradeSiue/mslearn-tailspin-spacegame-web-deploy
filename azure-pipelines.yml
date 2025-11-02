@@ -1,0 +1,179 @@
+# Azure DevOps multi-stage pipeline for Tailspin Space Game (Unit 3+)
+# - Builds .NET 8 web app
+# - Publishes a zipped artifact
+# - Deploys to Dev, Test (scheduled), and Staging (with approval via Environment protection)
+# Prereqs you’ll add in DevOps UI:
+#   1) Variable group "Release" with:
+#        WebAppNameDev, WebAppNameTest, WebAppNameStaging
+#   2) Service connection (Azure Resource Manager):
+#        "Resource Manager - Tailspin - Space Game"
+#   3) Environments: dev, test, staging (add approval on staging env in UI)
+
+trigger:
+  branches:
+    include:
+      - main
+      - release
+pr:
+  branches:
+    include:
+      - main
+
+# Nightly schedule example (UTC): 3 AM UTC daily
+# If you want local ~3 AM America/Chicago, use 09:00 UTC outside DST.
+schedules:
+- cron: "0 3 * * *"
+  displayName: "Nightly (3 AM UTC)"
+  branches:
+    include:
+      - release
+  always: false
+
+variables:
+- group: Release   # WebAppNameDev / WebAppNameTest / WebAppNameStaging
+
+stages:
+
+# =======================
+# Build Stage
+# =======================
+- stage: Build
+  displayName: "Build & Publish"
+  jobs:
+  - job: Build
+    pool:
+      vmImage: "ubuntu-latest"
+    steps:
+    - task: UseDotNet@2
+      displayName: "Install .NET 8 SDK"
+      inputs:
+        packageType: sdk
+        version: "8.x"
+
+    - script: |
+        dotnet --info
+        dotnet restore Tailspin.SpaceGame.Web.sln
+      displayName: "Restore"
+
+    - script: |
+        dotnet build Tailspin.SpaceGame.Web.sln -c Release --no-restore
+      displayName: "Build"
+
+    - script: |
+        dotnet test Tailspin.SpaceGame.Web.sln -c Release --no-build --verbosity normal
+      displayName: "Test"
+
+    - script: |
+        dotnet publish Tailspin.SpaceGame.Web/Tailspin.SpaceGame.Web.csproj -c Release -o $(Build.ArtifactStagingDirectory)/publish
+      displayName: "Publish"
+
+    - task: ArchiveFiles@2
+      displayName: "Archive published app to webapp.zip"
+      inputs:
+        rootFolderOrFile: "$(Build.ArtifactStagingDirectory)/publish"
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: "$(Build.ArtifactStagingDirectory)/webapp.zip"
+        replaceExistingArchive: true
+
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish artifact: webapp.zip"
+      inputs:
+        targetPath: "$(Build.ArtifactStagingDirectory)/webapp.zip"
+        artifact: "webapp"
+
+# =======================
+# Dev Stage
+# =======================
+- stage: Dev
+  displayName: "Deploy to Dev"
+  dependsOn: Build
+  condition: |
+    and(
+      succeeded(),
+      eq(variables['Build.SourceBranchName'], 'release')
+    )
+  jobs:
+  - deployment: DeployDev
+    environment: dev
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download webapp artifact"
+            inputs:
+              buildType: "current"
+              artifactName: "webapp"
+              targetPath: "$(Pipeline.Workspace)/webapp"
+
+          - task: AzureWebApp@1
+            displayName: "Deploy to Dev App Service"
+            inputs:
+              azureSubscription: "Resource Manager - Tailspin - Space Game"
+              appType: "webAppLinux"
+              appName: "$(WebAppNameDev)"
+              package: "$(Pipeline.Workspace)/webapp/webapp.zip"
+
+# =======================
+# Test Stage (Scheduled only)
+# =======================
+- stage: Test
+  displayName: "Deploy to Test (scheduled)"
+  dependsOn: Dev
+  condition: |
+    and(
+      succeeded(),
+      eq(variables['Build.Reason'], 'Schedule')
+    )
+  jobs:
+  - deployment: DeployTest
+    environment: test
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download webapp artifact"
+            inputs:
+              buildType: "current"
+              artifactName: "webapp"
+              targetPath: "$(Pipeline.Workspace)/webapp"
+
+          - task: AzureWebApp@1
+            displayName: "Deploy to Test App Service"
+            inputs:
+              azureSubscription: "Resource Manager - Tailspin - Space Game"
+              appType: "webAppLinux"
+              appName: "$(WebAppNameTest)"
+              package: "$(Pipeline.Workspace)/webapp/webapp.zip"
+
+# =======================
+# Staging Stage (requires approval configured on 'staging' environment)
+# =======================
+- stage: Staging
+  displayName: "Deploy to Staging (approval)"
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+  - deployment: DeployStaging
+    environment: staging   # set approvals in DevOps UI → Environments → staging → Approvals & checks
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download webapp artifact"
+            inputs:
+              buildType: "current"
+              artifactName: "webapp"
+              targetPath: "$(Pipeline.Workspace)/webapp"
+
+          - task: AzureWebApp@1
+            displayName: "Deploy to Staging App Service"
+            inputs:
+              azureSubscription: "Resource Manager - Tailspin - Space Game"
+              appType: "webAppLinux"
+              appName: "$(WebAppNameStaging)"
+              package: "$(Pipeline.Workspace)/webapp/webapp.zip"
+
